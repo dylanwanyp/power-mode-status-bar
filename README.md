@@ -16,7 +16,7 @@
 Power Mode Status Bar gives you three practical Mac power modes from the menu bar:
 
 - **Extreme Mode**: keep your Mac awake no matter whether it is plugged in, unplugged, open, or closed.
-- **Office Mode**: keep work running, then lock immediately when you close the lid without sleeping.
+- **Office Mode**: keep the system awake, let the display sleep on idle, then lock immediately when you close the lid without sleeping the Mac.
 - **Standby Mode**: lock immediately and sleep immediately when you close the lid.
 
 Normal mode switching is password-free. The app uses runtime IOPM assertions for everyday changes, so you do not get an `osascript` password prompt every time you switch modes. A separate manual menu item is available only when you intentionally want to apply system-level `pmset` settings.
@@ -43,6 +43,8 @@ The menu is intentionally small:
 - one rule summary for lid-close behavior
 - one rule summary for unplugged behavior
 - startup toggle
+- thermal auto cool-down toggle (on by default)
+- a cool-down status row and tooltip while a thermal cool-down is active
 - optional system-level settings action
 - quit
 
@@ -50,9 +52,28 @@ The mode rows include the core behavior directly in the menu:
 
 ```text
 Extreme Mode    Never sleeps or auto-locks
-Office Mode     Never sleeps; locks on lid close
+Office Mode     Display sleeps on idle; locks on lid close
 Standby Mode    Lid close locks and sleeps
 ```
+
+Office keeps preventing **system** idle sleep with the lid open or closed. It does not prevent **display** sleep, so the screen can turn off on idle. Closing the lid in Office still locks the screen and still does not sleep the system.
+
+## Thermal Auto Cool-Down
+
+**Thermal Auto Cool-Down** is on by default and stored in UserDefaults. Turn it off from the menu at any time.
+
+The app checks `ProcessInfo.processInfo.thermalState` at launch, whenever macOS posts a thermal-state change, and every 30 minutes. It does not use `powermetrics`, sudo, or a launchd job. The timer lives next to the existing one-second power monitor.
+
+If the state is **serious** or **critical** and the current mode is Office or Extreme, the app:
+
+1. Remembers that mode.
+2. Releases its IOPM sleep assertions so the Mac is actually allowed to sleep. Selecting Standby is not enough: Standby with the lid open on AC power still prevents sleep.
+3. Sleeps immediately through the existing `pmset sleepnow` path so the machine can cool.
+4. Restores the remembered mode 15 minutes later and reapplies its assertions, if cool-down is still enabled.
+
+Choosing any mode during cool-down cancels the pending restore and keeps the mode you picked. Turning the toggle off also cancels cool-down and returns to the selected mode. While cool-down is active, the menu and status-item tooltip show that it is active and the clock time when the mode will be restored.
+
+The optional **Apply System Settings (Admin Required)** action still writes a global `pmset` profile, including `displaysleep 0`. That system setting can keep the display awake even when Office is no longer holding a display-sleep assertion.
 
 ## How It Works
 
@@ -61,8 +82,9 @@ Standby Mode    Lid close locks and sleeps
 Power Mode Status Bar combines:
 
 - **AppKit status bar UI** for a lightweight native menu bar experience
-- **IOPM assertions** to prevent idle system sleep and display sleep without administrator prompts
+- **IOPM assertions** to prevent idle system sleep, and display sleep in the modes that require it, without administrator prompts
 - **power/lid state monitoring** to update behavior when AC power, battery power, or lid state changes
+- **thermal cool-down** that reads `ProcessInfo.thermalState` and temporarily releases sleep assertions when Office or Extreme is overheating
 - **optional `pmset` commands** for users who explicitly choose system-level settings
 
 This keeps the common path fast and quiet while still leaving a manual advanced path for users who want persistent global power settings.

@@ -7,10 +7,13 @@ protocol StatusMenuControllerDelegate: AnyObject {
     var currentMode: PowerMode { get }
     var currentRuleSummary: RuleSummary { get }
     var isOpenAtLoginEnabled: Bool { get }
+    var isThermalAutoCooldownEnabled: Bool { get }
+    var thermalCooldownStatusLine: String? { get }
     var statusError: String? { get }
 
     func selectMode(_ mode: PowerMode)
     func toggleOpenAtLogin()
+    func toggleThermalAutoCooldown()
     func reapplyPolicy()
     func quit()
 }
@@ -46,7 +49,7 @@ final class StatusMenuController: NSObject {
             accessibilityDescription: delegate.currentMode.title
         )
         button.image?.isTemplate = true
-        button.toolTip = delegate.currentMode.title
+        button.toolTip = delegate.thermalCooldownStatusLine ?? delegate.currentMode.title
     }
 
     private func makeMenu() -> NSMenu {
@@ -55,6 +58,13 @@ final class StatusMenuController: NSObject {
 
         guard let delegate else {
             return menu
+        }
+
+        if let statusLine = delegate.thermalCooldownStatusLine {
+            let cooldownItem = NSMenuItem(title: statusLine, action: nil, keyEquivalent: "")
+            cooldownItem.isEnabled = false
+            menu.addItem(cooldownItem)
+            menu.addItem(.separator())
         }
 
         for mode in PowerMode.allCases {
@@ -89,6 +99,15 @@ final class StatusMenuController: NSObject {
         loginItem.target = self
         loginItem.state = delegate.isOpenAtLoginEnabled ? .on : .off
         menu.addItem(loginItem)
+
+        let thermalItem = NSMenuItem(
+            title: "Thermal Auto Cool-Down",
+            action: #selector(thermalAutoCooldownSelected(_:)),
+            keyEquivalent: ""
+        )
+        thermalItem.target = self
+        thermalItem.state = delegate.isThermalAutoCooldownEnabled ? .on : .off
+        menu.addItem(thermalItem)
 
         let reapplyItem = NSMenuItem(
             title: "Apply System Settings (Admin Required)",
@@ -129,6 +148,10 @@ final class StatusMenuController: NSObject {
 
     @objc private func openAtLoginSelected(_ sender: NSMenuItem) {
         delegate?.toggleOpenAtLogin()
+    }
+
+    @objc private func thermalAutoCooldownSelected(_ sender: NSMenuItem) {
+        delegate?.toggleThermalAutoCooldown()
     }
 
     @objc private func reapplySelected(_ sender: NSMenuItem) {

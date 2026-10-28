@@ -13,7 +13,14 @@ final class AppCoordinator: NSObject {
     private lazy var menuController = StatusMenuController(delegate: self)
 
     private var monitorTimer: Timer?
+    private var thermalCheckTimer: Timer?
+    private var cooldownRestoreTimer: Timer?
+    private var thermalStateObserver: NSObjectProtocol?
     private var handledLidClosureMode: PowerMode?
+    private var cooldownSession: ThermalCooldownSession?
+    /// Wall-clock deadline for the next periodic thermal check. `Timer` does not advance during
+    /// system sleep, so the one-second monitor also honors this date after the Mac wakes.
+    private var nextThermalCheckAt = Date.distantFuture
     private(set) var selectedMode: PowerMode {
         didSet {
             preferences.selectedMode = selectedMode
@@ -26,6 +33,12 @@ final class AppCoordinator: NSObject {
         }
     }
 
+    private(set) var thermalAutoCooldownEnabled: Bool {
+        didSet {
+            preferences.thermalAutoCooldownEnabled = thermalAutoCooldownEnabled
+        }
+    }
+
     private(set) var lastError: String? {
         didSet {
             menuController.update()
@@ -35,6 +48,7 @@ final class AppCoordinator: NSObject {
     override init() {
         selectedMode = preferences.selectedMode
         openAtLoginEnabled = preferences.openAtLoginEnabled
+        thermalAutoCooldownEnabled = preferences.thermalAutoCooldownEnabled
         super.init()
     }
 
@@ -43,6 +57,7 @@ final class AppCoordinator: NSObject {
         menuController.install()
         applySelectedMode(reason: "launch", applySystemSettings: false)
         startMonitoring()
+        startThermalMonitoring()
     }
 
     private func configureDefaultLoginItem() {
@@ -73,8 +88,154 @@ final class AppCoordinator: NSObject {
         RunLoop.main.add(monitorTimer!, forMode: .common)
     }
 
+    private func startThermalMonitoring() {
+        if thermalStateObserver == nil {
+            thermalStateObserver = NotificationCenter.default.addObserver(
+                forName: ProcessInfo.thermalStateDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.evaluateThermalPressure()
+                }
+            }
+        }
+
+        scheduleNextThermalCheck()
+        evaluateThermalPressure()
+    }
+
+    private func scheduleNextThermalCheck() {
+        thermalCheckTimer?.invalidate()
+        let fireAt = Date().addingTimeInterval(ThermalCooldownPolicy.checkInterval)
+        nextThermalCheckAt = fireAt
+        let timer = Timer(
+            fireAt: fireAt,
+            interval: 0,
+            target: self,
+            selector: #selector(thermalCheckTimerFired(_:)),
+            userInfo: nil,
+            repeats: false
+        )
+        timer.tolerance = 30
+        RunLoop.main.add(timer, forMode: .common)
+        thermalCheckTimer = timer
+    }
+
     @objc private func monitorTimerFired(_ timer: Timer) {
+        if Date() >= nextThermalCheckAt {
+            performScheduledThermalCheck()
+        }
         applyRuntimePolicy()
+    }
+
+    @objc private func thermalCheckTimerFired(_ timer: Timer) {
+        performScheduledThermalCheck()
+    }
+
+    private func performScheduledThermalCheck() {
+        scheduleNextThermalCheck()
+        evaluateThermalPressure()
+    }
+
+    @objc private func cooldownRestoreTimerFired(_ timer: Timer) {
+        guard let session = cooldownSession else {
+            return
+        }
+        finishThermalCooldown(session: session)
+    }
+
+    private func evaluateThermalPressure() {
+        let pressure = ThermalPressureLevel(processThermalState: ProcessInfo.processInfo.thermalState)
+        guard ThermalCooldownPolicy.shouldBeginCooldown(
+            enabled: thermalAutoCooldownEnabled,
+            pressure: pressure,
+            mode: selectedMode,
+            cooldownActive: cooldownSession != nil
+        ) else {
+            return
+        }
+
+        beginThermalCooldown(preferredMode: selectedMode)
+    }
+
+    private func beginThermalCooldown(preferredMode: PowerMode) {
+        guard !isDryRun else {
+            print("[PowerModeStatusBar] dry-run skipped thermal cool-down for \(preferredMode.title)")
+            return
+        }
+
+        let session = ThermalCooldownSession(preferredMode: preferredMode, startedAt: Date())
+        cooldownSession = session
+        scheduleCooldownRestore(at: session.restoreAt)
+        assertionManager.apply(ThermalCooldownPolicy.releasedAssertions)
+        menuController.update()
+        print("[PowerModeStatusBar] thermal cool-down started; restoring \(preferredMode.title) at \(session.restoreAt)")
+
+        // Give IOPM a moment to drop the assertions before requesting sleep.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self, self.cooldownSession != nil else {
+                return
+            }
+            SystemSleeper.sleepNow()
+        }
+    }
+
+    private func scheduleCooldownRestore(at date: Date) {
+        cooldownRestoreTimer?.invalidate()
+        let timer = Timer(
+            fireAt: date,
+            interval: 0,
+            target: self,
+            selector: #selector(cooldownRestoreTimerFired(_:)),
+            userInfo: nil,
+            repeats: false
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        cooldownRestoreTimer = timer
+    }
+
+    private func finishThermalCooldown(session: ThermalCooldownSession) {
+        guard cooldownSession == session else {
+            return
+        }
+
+        let shouldRestore = ThermalCooldownPolicy.shouldRestorePreferredMode(
+            enabled: thermalAutoCooldownEnabled,
+            cooldownActive: true,
+            userDidOverride: false
+        )
+        clearThermalCooldownSchedule()
+
+        if shouldRestore && selectedMode != session.preferredMode {
+            selectedMode = session.preferredMode
+        }
+        // Disabled cool-down still reapplies the selected mode so assertions are not left released.
+        // User override never reaches this method: choosing a mode clears the session first.
+        applySelectedMode(
+            reason: shouldRestore ? "thermal-restore" : "thermal-cooldown-ended",
+            applySystemSettings: false
+        )
+        // An overdue periodic check must not start another cool-down in the same wake.
+        // The next 30-minute check, or a later thermal-state change, can start one.
+        if Date() >= nextThermalCheckAt {
+            scheduleNextThermalCheck()
+        }
+    }
+
+    /// Manual mode selection wins. Clears the pending restore without applying the remembered mode.
+    private func cancelThermalCooldownForUserSelection() -> Bool {
+        guard cooldownSession != nil else {
+            return false
+        }
+        clearThermalCooldownSchedule()
+        return true
+    }
+
+    private func clearThermalCooldownSchedule() {
+        cooldownRestoreTimer?.invalidate()
+        cooldownRestoreTimer = nil
+        cooldownSession = nil
     }
 
     private func applySelectedMode(reason: String, applySystemSettings: Bool) {
@@ -99,6 +260,17 @@ final class AppCoordinator: NSObject {
     }
 
     private func applyRuntimePolicy() {
+        if let session = cooldownSession {
+            // `Date` keeps moving while the Mac sleeps, so this restores the preferred mode
+            // on wake once 15 minutes have passed even if the restore timer was suspended.
+            if session.isDue(at: Date()) {
+                finishThermalCooldown(session: session)
+                return
+            }
+            assertionManager.apply(ThermalCooldownPolicy.releasedAssertions)
+            return
+        }
+
         let snapshot = stateProvider.snapshot()
         let runtimePolicy = PowerPolicy.runtimePolicy(for: selectedMode, snapshot: snapshot)
         assertionManager.apply(runtimePolicy)
@@ -140,6 +312,17 @@ final class AppCoordinator: NSObject {
             SystemSleeper.sleepNow()
         }
     }
+
+    private var thermalCooldownStatusText: String? {
+        guard let cooldownSession else {
+            return nil
+        }
+        let restoreTime = cooldownSession.restoreAt.formatted(date: .omitted, time: .shortened)
+        return ThermalCooldownPolicy.statusLine(
+            modeTitle: cooldownSession.preferredMode.title,
+            restoreTime: restoreTime
+        )
+    }
 }
 
 extension AppCoordinator: StatusMenuControllerDelegate {
@@ -155,15 +338,26 @@ extension AppCoordinator: StatusMenuControllerDelegate {
         openAtLoginEnabled
     }
 
+    var isThermalAutoCooldownEnabled: Bool {
+        thermalAutoCooldownEnabled
+    }
+
+    var thermalCooldownStatusLine: String? {
+        thermalCooldownStatusText
+    }
+
     var statusError: String? {
         lastError
     }
 
     func selectMode(_ mode: PowerMode) {
-        guard selectedMode != mode else {
+        let cancelledCooldown = cancelThermalCooldownForUserSelection()
+        guard selectedMode != mode || cancelledCooldown else {
             return
         }
-        selectedMode = mode
+        if selectedMode != mode {
+            selectedMode = mode
+        }
         applySelectedMode(reason: "menu", applySystemSettings: false)
     }
 
@@ -186,11 +380,32 @@ extension AppCoordinator: StatusMenuControllerDelegate {
         menuController.update()
     }
 
+    func toggleThermalAutoCooldown() {
+        thermalAutoCooldownEnabled.toggle()
+        if thermalAutoCooldownEnabled {
+            evaluateThermalPressure()
+        } else if let session = cooldownSession {
+            clearThermalCooldownSchedule()
+            if selectedMode != session.preferredMode {
+                selectedMode = session.preferredMode
+            }
+            applySelectedMode(reason: "thermal-disabled", applySystemSettings: false)
+        }
+        menuController.update()
+    }
+
     func reapplyPolicy() {
         applySelectedMode(reason: "manual", applySystemSettings: true)
     }
 
     func quit() {
+        monitorTimer?.invalidate()
+        thermalCheckTimer?.invalidate()
+        cooldownRestoreTimer?.invalidate()
+        if let thermalStateObserver {
+            NotificationCenter.default.removeObserver(thermalStateObserver)
+            self.thermalStateObserver = nil
+        }
         assertionManager.releaseAll()
         NSApp.terminate(nil)
     }

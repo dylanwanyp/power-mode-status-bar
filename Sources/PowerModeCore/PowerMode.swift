@@ -32,7 +32,7 @@ public enum PowerMode: String, CaseIterable, Codable, Equatable, Sendable {
         case .extreme:
             return "Never sleeps or auto-locks"
         case .office:
-            return "Never sleeps; locks on lid close"
+            return "Display sleeps on idle; locks on lid close"
         case .standby:
             return "Lid close locks and sleeps"
         }
