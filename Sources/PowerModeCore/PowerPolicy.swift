@@ -36,9 +36,11 @@ public enum PowerPolicy {
                 sleepOnCurrentLidClosure: false
             )
         case .office:
+            // Stay awake as a system, but let the panel sleep on idle with the lid open.
+            // Lid-closed Office still locks, still prevents system sleep, and still allows display sleep.
             return RuntimePowerPolicy(
                 preventSystemSleep: true,
-                preventDisplaySleep: !lidClosed,
+                preventDisplaySleep: false,
                 lockOnCurrentLidClosure: lidClosed,
                 sleepOnCurrentLidClosure: false
             )

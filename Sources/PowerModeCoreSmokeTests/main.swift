@@ -51,7 +51,7 @@ func testCoreFeatureSummaries() throws {
         "extreme core feature summary mismatch"
     )
     try expect(
-        PowerMode.office.coreFeatureSummary == "Never sleeps; locks on lid close",
+        PowerMode.office.coreFeatureSummary == "Display sleeps on idle; locks on lid close",
         "office core feature summary mismatch"
     )
     try expect(
@@ -118,10 +118,19 @@ func testRuntimePolicies() throws {
         for: .office,
         snapshot: SystemPowerSnapshot(powerSource: .battery, lidState: .open)
     )
-    try expect(officeOpenBattery.preventSystemSleep, "office battery open should prevent sleep")
-    try expect(officeOpenBattery.preventDisplaySleep, "office battery open should prevent display sleep")
+    try expect(officeOpenBattery.preventSystemSleep, "office battery open should prevent system sleep")
+    try expect(!officeOpenBattery.preventDisplaySleep, "office battery open should allow display sleep")
     try expect(!officeOpenBattery.lockOnCurrentLidClosure, "office battery open should not lock")
     try expect(!officeOpenBattery.sleepOnCurrentLidClosure, "office battery open should not sleep")
+
+    let officeOpenAC = PowerPolicy.runtimePolicy(
+        for: .office,
+        snapshot: SystemPowerSnapshot(powerSource: .ac, lidState: .open)
+    )
+    try expect(officeOpenAC.preventSystemSleep, "office AC open should prevent system sleep")
+    try expect(!officeOpenAC.preventDisplaySleep, "office AC open should allow display sleep")
+    try expect(!officeOpenAC.lockOnCurrentLidClosure, "office AC open should not lock")
+    try expect(!officeOpenAC.sleepOnCurrentLidClosure, "office AC open should not sleep")
 
     let standbyACClosed = PowerPolicy.runtimePolicy(
         for: .standby,
@@ -160,11 +169,203 @@ func testRuntimePolicies() throws {
     try expect(standbyBatteryClosed.sleepOnCurrentLidClosure, "standby battery closed should sleep")
 }
 
+func testOfficeLidOpenAllowsDisplaySleep() throws {
+    for powerSource in [PowerSource.ac, .battery, .unknown] {
+        for lidState in [LidState.open, .unknown] {
+            let policy = PowerPolicy.runtimePolicy(
+                for: .office,
+                snapshot: SystemPowerSnapshot(powerSource: powerSource, lidState: lidState)
+            )
+            try expect(
+                policy.preventSystemSleep,
+                "office \(powerSource) \(lidState) should prevent system sleep"
+            )
+            try expect(
+                !policy.preventDisplaySleep,
+                "office \(powerSource) \(lidState) should allow display sleep"
+            )
+            try expect(!policy.lockOnCurrentLidClosure, "office with lid not closed should not lock")
+            try expect(!policy.sleepOnCurrentLidClosure, "office should not sleep on lid close")
+        }
+    }
+}
+
+func testThermalCooldownPolicy() throws {
+    try expect(ThermalCooldownPolicy.checkInterval == 30 * 60, "thermal check interval should be 30 minutes")
+    try expect(ThermalCooldownPolicy.restoreDelay == 15 * 60, "thermal restore delay should be 15 minutes")
+
+    try expect(ThermalCooldownPolicy.participatesInCooldown(.office), "office participates in cool-down")
+    try expect(ThermalCooldownPolicy.participatesInCooldown(.extreme), "extreme participates in cool-down")
+    try expect(!ThermalCooldownPolicy.participatesInCooldown(.standby), "standby does not participate in cool-down")
+
+    for pressure in [ThermalPressureLevel.nominal, .fair] {
+        try expect(!pressure.requiresCooldown, "\(pressure) should not require cool-down")
+        try expect(
+            !ThermalCooldownPolicy.shouldBeginCooldown(
+                enabled: true,
+                pressure: pressure,
+                mode: .office,
+                cooldownActive: false
+            ),
+            "\(pressure) office should not start cool-down"
+        )
+    }
+
+    for pressure in [ThermalPressureLevel.serious, .critical] {
+        try expect(pressure.requiresCooldown, "\(pressure) should require cool-down")
+        for mode in [PowerMode.office, .extreme] {
+            try expect(
+                ThermalCooldownPolicy.shouldBeginCooldown(
+                    enabled: true,
+                    pressure: pressure,
+                    mode: mode,
+                    cooldownActive: false
+                ),
+                "\(pressure) \(mode) should start cool-down"
+            )
+            try expect(
+                !ThermalCooldownPolicy.shouldBeginCooldown(
+                    enabled: false,
+                    pressure: pressure,
+                    mode: mode,
+                    cooldownActive: false
+                ),
+                "disabled cool-down should not start for \(pressure) \(mode)"
+            )
+            try expect(
+                !ThermalCooldownPolicy.shouldBeginCooldown(
+                    enabled: true,
+                    pressure: pressure,
+                    mode: mode,
+                    cooldownActive: true
+                ),
+                "active cool-down should not start again for \(pressure) \(mode)"
+            )
+        }
+        try expect(
+            !ThermalCooldownPolicy.shouldBeginCooldown(
+                enabled: true,
+                pressure: pressure,
+                mode: .standby,
+                cooldownActive: false
+            ),
+            "\(pressure) standby should not start cool-down"
+        )
+    }
+
+    let released = ThermalCooldownPolicy.releasedAssertions
+    try expect(
+        released == RuntimePowerPolicy(
+            preventSystemSleep: false,
+            preventDisplaySleep: false,
+            lockOnCurrentLidClosure: false,
+            sleepOnCurrentLidClosure: false
+        ),
+        "cool-down must release sleep assertions"
+    )
+
+    let standbyOpenAC = PowerPolicy.runtimePolicy(
+        for: .standby,
+        snapshot: SystemPowerSnapshot(powerSource: .ac, lidState: .open)
+    )
+    try expect(standbyOpenAC.preventSystemSleep, "standby AC open still prevents system sleep")
+    try expect(
+        !released.preventSystemSleep && !released.preventDisplaySleep,
+        "cool-down must not reuse the standby AC-open assertion policy"
+    )
+
+    let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let session = ThermalCooldownSession(preferredMode: .office, startedAt: startedAt)
+    try expect(session.preferredMode == .office, "session should remember office")
+    try expect(
+        session.restoreAt == startedAt.addingTimeInterval(ThermalCooldownPolicy.restoreDelay),
+        "session restore time should be 15 minutes after start"
+    )
+    try expect(!session.isDue(at: session.restoreAt.addingTimeInterval(-1)), "cool-down is not due early")
+    try expect(session.isDue(at: session.restoreAt), "cool-down is due at the restore time")
+
+    try expect(
+        ThermalCooldownPolicy.shouldRestorePreferredMode(
+            enabled: true,
+            cooldownActive: true,
+            userDidOverride: false
+        ),
+        "enabled cool-down without an override should restore"
+    )
+    try expect(
+        !ThermalCooldownPolicy.shouldRestorePreferredMode(
+            enabled: false,
+            cooldownActive: true,
+            userDidOverride: false
+        ),
+        "disabled cool-down should not restore on the timer"
+    )
+    try expect(
+        !ThermalCooldownPolicy.shouldRestorePreferredMode(
+            enabled: true,
+            cooldownActive: true,
+            userDidOverride: true
+        ),
+        "manual mode selection should cancel the pending restore"
+    )
+    try expect(
+        !ThermalCooldownPolicy.shouldRestorePreferredMode(
+            enabled: true,
+            cooldownActive: false,
+            userDidOverride: false
+        ),
+        "inactive cool-down should not restore"
+    )
+    try expect(
+        ThermalCooldownPolicy.statusLine(modeTitle: "Office Mode", restoreTime: "3:45 PM")
+            == "Thermal cool-down active: restores Office Mode at 3:45 PM",
+        "cool-down status line mismatch"
+    )
+}
+
+#if os(macOS)
+func testProcessThermalStateMapping() throws {
+    try expect(
+        ThermalPressureLevel(processThermalState: .nominal) == .nominal,
+        "nominal thermal state mapping mismatch"
+    )
+    try expect(
+        ThermalPressureLevel(processThermalState: .fair) == .fair,
+        "fair thermal state mapping mismatch"
+    )
+    try expect(
+        ThermalPressureLevel(processThermalState: .serious) == .serious,
+        "serious thermal state mapping mismatch"
+    )
+    try expect(
+        ThermalPressureLevel(processThermalState: .critical) == .critical,
+        "critical thermal state mapping mismatch"
+    )
+    try expect(
+        ThermalPressureLevel(processThermalState: .serious).requiresCooldown,
+        "mapped serious state should require cool-down"
+    )
+    try expect(
+        ThermalPressureLevel(processThermalState: .critical).requiresCooldown,
+        "mapped critical state should require cool-down"
+    )
+    try expect(
+        !ThermalPressureLevel(processThermalState: .fair).requiresCooldown,
+        "mapped fair state should not require cool-down"
+    )
+}
+#endif
+
 do {
     try testRuleSummaryDisplayLines()
     try testCoreFeatureSummaries()
     try testSystemCommandPlans()
     try testRuntimePolicies()
+    try testOfficeLidOpenAllowsDisplaySleep()
+    try testThermalCooldownPolicy()
+    #if os(macOS)
+    try testProcessThermalStateMapping()
+    #endif
     print("PowerModeCoreSmokeTests passed")
 } catch {
     fputs("PowerModeCoreSmokeTests failed: \(error)\n", stderr)

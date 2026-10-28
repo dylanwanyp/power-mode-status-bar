@@ -8,6 +8,7 @@ final class AppPreferences {
         static let selectedMode = "selectedMode"
         static let openAtLoginEnabled = "openAtLoginEnabled"
         static let didSeedOpenAtLogin = "didSeedOpenAtLogin"
+        static let thermalAutoCooldownEnabled = "thermalAutoCooldownEnabled"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -36,6 +37,19 @@ final class AppPreferences {
         }
         set {
             defaults.set(newValue, forKey: Key.openAtLoginEnabled)
+        }
+    }
+
+    /// On by default, including installs that have never written the key.
+    var thermalAutoCooldownEnabled: Bool {
+        get {
+            if defaults.object(forKey: Key.thermalAutoCooldownEnabled) == nil {
+                return true
+            }
+            return defaults.bool(forKey: Key.thermalAutoCooldownEnabled)
+        }
+        set {
+            defaults.set(newValue, forKey: Key.thermalAutoCooldownEnabled)
         }
     }
 
